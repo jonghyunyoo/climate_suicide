@@ -1,0 +1,236 @@
+# age_mod.R
+# Revised age-specific heterogeneity analysis.
+# Key changes relative to the original script:
+#   1) Temperature and precipitation interactions are estimated jointly.
+#   2) The stacked age panel uses age-specific fixed effects.
+#   3) Age is centered and scaled so that one unit equals a 5-year increase.
+# Equation implemented:
+#   Y_iasmt = beta_T T_ismt + beta_P P_ismt
+#             + lambda_T (T_ismt x Age5_c_a) + lambda_P (P_ismt x Age5_c_a)
+#             + mu_ima + delta_sta + e_iasmt
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(stringr)
+  library(lfe)
+  library(tibble)
+})
+
+source_candidates <- c("scripts/functions_mod.R", "functions_mod.R")
+source_found <- source_candidates[file.exists(source_candidates)][1]
+if (!is.na(source_found)) source(source_found)
+
+if (!exists("get_term")) {
+  get_term <- function(coefs, candidates) {
+    hit <- candidates[candidates %in% names(coefs)]
+    if (length(hit) == 0) return(NA_character_)
+    hit[1]
+  }
+}
+if (!exists("lincom_effect")) {
+  lincom_effect <- function(model, base_term, interaction_term = NULL, x = 0, scale = 1) {
+    b <- coef(model); V <- vcov(model)
+    est <- unname(b[base_term]); var <- V[base_term, base_term]
+    if (!is.null(interaction_term) && !is.na(interaction_term) && interaction_term %in% names(b)) {
+      est <- est + x * unname(b[interaction_term])
+      var <- var + x^2 * V[interaction_term, interaction_term] + 2 * x * V[base_term, interaction_term]
+    }
+    est <- est * scale; se <- sqrt(var) * abs(scale)
+    data.frame(est = est, se = se, lower = est - 1.96 * se, upper = est + 1.96 * se)
+  }
+}
+if (!exists("coef_extract")) {
+  coef_extract <- function(model, term, label = term, scale = 1) {
+    b <- coef(model); V <- vcov(model)
+    if (!term %in% names(b)) return(data.frame(term = label, est = NA_real_, se = NA_real_, t = NA_real_, p = NA_real_))
+    se <- sqrt(V[term, term]); est <- unname(b[term]); tval <- est / se
+    data.frame(term = label, est = est * scale, se = se * abs(scale), t = tval,
+               p = 2 * pnorm(abs(tval), lower.tail = FALSE))
+  }
+}
+
+base_path <- "inputs"
+out_dir <- file.path(base_path, "outputs_age_mod")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+f_base <- file.path(base_path, "SuicideData_ROK.csv")
+f_age <- file.path(base_path, "suicide_age.csv")
+f_pop <- file.path(base_path, "age_population.csv")
+stopifnot(file.exists(f_base), file.exists(f_age), file.exists(f_pop))
+
+base <- read_csv(f_base, show_col_types = FALSE) %>%
+  mutate(
+    fips = as.character(fips),
+    year = as.integer(ifelse("year" %in% names(.), year, yr)),
+    month = as.integer(month),
+    state = if ("state" %in% names(.)) as.character(state) else substr(fips, 1, 2),
+    fipsmo = interaction(fips, month, drop = TRUE),
+    stateyear = interaction(state, year, drop = TRUE)
+  )
+
+suD <- read_csv(f_age, show_col_types = FALSE) %>%
+  mutate(fips = as.character(fips), year = as.integer(year), month = as.integer(month))
+
+popD <- read_csv(f_pop, show_col_types = FALSE) %>%
+  mutate(fips = as.character(fips), sex = as.integer(sex), age = as.integer(age))
+
+base2 <- base %>%
+  select(fips, year, month, state, fipsmo, stateyear, tmean, prec)
+
+age_map <- tibble(
+  age_code = 3:19,
+  age_label = c(
+    "5-9", "10-14", "15-19", "20-24", "25-29", "30-34", "35-39",
+    "40-44", "45-49", "50-54", "55-59", "60-64", "65-69",
+    "70-74", "75-79", "80-84", "85+"
+  ),
+  age_mid = c(7, 12, 17, 22, 27, 32, 37, 42, 47, 52, 57, 62, 67, 72, 77, 82, 87)
+)
+
+age_vars <- paste0("age_", 3:19)
+missing_age_vars <- setdiff(age_vars, names(suD))
+if (length(missing_age_vars) > 0) {
+  stop("suicide_age.csv is missing: ", paste(missing_age_vars, collapse = ", "))
+}
+
+su_long <- suD %>%
+  select(fips, year, month, all_of(age_vars)) %>%
+  pivot_longer(cols = all_of(age_vars), names_to = "age_var", values_to = "deaths") %>%
+  mutate(age_code = as.integer(str_remove(age_var, "age_"))) %>%
+  left_join(age_map, by = "age_code")
+
+pop_long <- popD %>%
+  filter(sex == 3L, age %in% 3:19) %>%
+  pivot_longer(cols = starts_with("pop_"), names_to = "year_var", values_to = "population") %>%
+  mutate(year = as.integer(str_remove(year_var, "pop_")), age_code = age) %>%
+  select(fips, year, age_code, population) %>%
+  tidyr::crossing(month = 1:12) %>%
+  mutate(month = as.integer(month)) %>%
+  left_join(age_map, by = "age_code")
+
+dat_age <- su_long %>%
+  left_join(pop_long, by = c("fips", "year", "month", "age_code", "age_label", "age_mid")) %>%
+  left_join(base2, by = c("fips", "year", "month")) %>%
+  mutate(
+    deaths = as.numeric(deaths),
+    population = as.numeric(population),
+    rate_adj = ifelse(!is.na(population) & population > 0, deaths / population * 100000, NA_real_)
+  ) %>%
+  filter(!is.na(rate_adj), !is.na(tmean), !is.na(prec), !is.na(age_mid), !is.na(population), population > 0)
+
+age_mid_mean <- weighted.mean(dat_age$age_mid, dat_age$population, na.rm = TRUE)
+
+dat_age <- dat_age %>%
+  mutate(
+    age5_c = (age_mid - age_mid_mean) / 5,
+    fipsmo_age = interaction(fipsmo, age_code, drop = TRUE),
+    stateyear_age = interaction(stateyear, age_code, drop = TRUE)
+  )
+
+write_csv(tibble(age_mid_weighted_mean = age_mid_mean), file.path(out_dir, "age_center_used.csv"))
+
+baseline_tbl <- dat_age %>%
+  group_by(age_code, age_label, age_mid) %>%
+  summarise(
+    total_deaths = sum(deaths, na.rm = TRUE),
+    total_pop = sum(population, na.rm = TRUE),
+    baseline_rate = total_deaths / total_pop * 100000,
+    mean_rate_cell = mean(rate_adj, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(age_code)
+write_csv(baseline_tbl, file.path(out_dir, "baseline_by_age.csv"))
+
+mod_age <- felm(
+  rate_adj ~ tmean + prec + tmean:age5_c + prec:age5_c |
+    fipsmo_age + stateyear_age | 0 | fips,
+  data = dat_age,
+  weights = dat_age$population
+)
+
+b <- coef(mod_age)
+tx <- get_term(b, c("tmean:age5_c", "age5_c:tmean"))
+px <- get_term(b, c("prec:age5_c", "age5_c:prec"))
+
+coef_tbl <- bind_rows(
+  coef_extract(mod_age, "tmean", "Temperature"),
+  coef_extract(mod_age, "prec", "Precipitation"),
+  coef_extract(mod_age, tx, "Temperature x age5_c"),
+  coef_extract(mod_age, px, "Precipitation x age5_c")
+) %>%
+  mutate(N = mod_age$N, .before = 1)
+write_csv(coef_tbl, file.path(out_dir, "age_model_coefficients.csv"))
+
+age_effect_tbl <- age_map %>%
+  mutate(age5_c = (age_mid - age_mid_mean) / 5) %>%
+  rowwise() %>%
+  mutate(
+    tmp = list(lincom_effect(mod_age, "tmean", tx, x = age5_c, scale = 1)),
+    prc = list(lincom_effect(mod_age, "prec", px, x = age5_c, scale = 100))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    temp_effect_per_1C = sapply(tmp, function(z) z$est),
+    temp_se = sapply(tmp, function(z) z$se),
+    temp_lower = sapply(tmp, function(z) z$lower),
+    temp_upper = sapply(tmp, function(z) z$upper),
+    precip_effect_per_100mm = sapply(prc, function(z) z$est),
+    precip_se = sapply(prc, function(z) z$se),
+    precip_lower = sapply(prc, function(z) z$lower),
+    precip_upper = sapply(prc, function(z) z$upper)
+  ) %>%
+  select(-tmp, -prc) %>%
+  left_join(baseline_tbl %>% select(age_code, baseline_rate), by = "age_code") %>%
+  mutate(
+    temp_pct_per_1C = temp_effect_per_1C / baseline_rate * 100,
+    precip_pct_per_100mm = precip_effect_per_100mm / baseline_rate * 100
+  ) %>%
+  arrange(age_code)
+write_csv(age_effect_tbl, file.path(out_dir, "age_marginal_effects_by_agebin.csv"))
+
+# Representative groups. Because the interaction is linear in age5_c,
+# the population-weighted average effect equals the effect evaluated at the
+# population-weighted average value of age5_c within each representative group.
+rep_groups <- dat_age %>%
+  mutate(
+    age_group = case_when(
+      age_mid >= 22 & age_mid <= 37 ~ "20-39",
+      age_mid >= 67 ~ "65+",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(age_group)) %>%
+  group_by(age_group) %>%
+  summarise(
+    age5_c = weighted.mean(age5_c, population, na.rm = TRUE),
+    total_deaths = sum(deaths, na.rm = TRUE),
+    total_pop = sum(population, na.rm = TRUE),
+    baseline_rate = total_deaths / total_pop * 100000,
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    tmp = list(lincom_effect(mod_age, "tmean", tx, x = age5_c, scale = 1)),
+    prc = list(lincom_effect(mod_age, "prec", px, x = age5_c, scale = 100))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    temp_effect_per_1C = sapply(tmp, function(z) z$est),
+    temp_se = sapply(tmp, function(z) z$se),
+    temp_lower = sapply(tmp, function(z) z$lower),
+    temp_upper = sapply(tmp, function(z) z$upper),
+    precip_effect_per_100mm = sapply(prc, function(z) z$est),
+    precip_se = sapply(prc, function(z) z$se),
+    precip_lower = sapply(prc, function(z) z$lower),
+    precip_upper = sapply(prc, function(z) z$upper),
+    temp_pct_per_1C = temp_effect_per_1C / baseline_rate * 100,
+    precip_pct_per_100mm = precip_effect_per_100mm / baseline_rate * 100
+  ) %>%
+  select(-tmp, -prc)
+write_csv(rep_groups, file.path(out_dir, "representative_age_group_effects.csv"))
+
+print(coef_tbl)
+print(age_effect_tbl, n = Inf)
+print(rep_groups)
